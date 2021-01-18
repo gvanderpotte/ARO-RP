@@ -156,7 +156,7 @@ func TestQuotaCheck(t *testing.T) {
 						},
 					},
 				},
-				spUsage: usageClient,
+				spComputeUsage: usageClient,
 			}
 
 			err := qv.Validate(ctx)

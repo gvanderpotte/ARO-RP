@@ -14,6 +14,7 @@ import (
 	"github.com/Azure/ARO-RP/pkg/api"
 	"github.com/Azure/ARO-RP/pkg/env"
 	"github.com/Azure/ARO-RP/pkg/util/azureclient/mgmt/compute"
+	"github.com/Azure/ARO-RP/pkg/util/azureclient/mgmt/network"
 )
 
 func addRequiredResources(requiredResources map[string]int, vmSize api.VMSize, count int) error {
@@ -91,8 +92,9 @@ type quotaValidator struct {
 	log *logrus.Entry
 	env env.Interface
 
-	oc      *api.OpenShiftCluster
-	spUsage compute.UsageClient
+	oc             *api.OpenShiftCluster
+	spComputeUsage compute.UsageClient
+	spNetworkUsage network.UsageClient
 }
 
 func NewAzureQuotaValidator(ctx context.Context, log *logrus.Entry, env env.Interface, oc *api.OpenShiftCluster, subscriptionDoc *api.SubscriptionDocument) (AzureQuotaValidator, error) {
@@ -110,8 +112,9 @@ func NewAzureQuotaValidator(ctx context.Context, log *logrus.Entry, env env.Inte
 		log: log,
 		env: env,
 
-		oc:      oc,
-		spUsage: compute.NewUsageClient(env.Environment(), r.SubscriptionID, spAuthorizer),
+		oc:             oc,
+		spComputeUsage: compute.NewUsageClient(env.Environment(), r.SubscriptionID, spAuthorizer),
+		spNetworkUsage: network.NewUsageClient(env.Environment(), r.SubscriptionID, spAuthorizer),
 	}
 
 	return validator, nil
@@ -135,21 +138,40 @@ func (qv *quotaValidator) Validate(ctx context.Context) error {
 		}
 	}
 
-	usages, err := qv.spUsage.List(ctx, qv.oc.Location)
-	if err != nil {
-		return err
-	}
-	//check requirements vs. usage
+	//Public IP Addresses minimum requirement: 2 for ARM template deployment and 1 for kube-controller-manager
+	requiredResources["PublicIPAddresses"] = 3
 
+	//check requirements vs. usage
 	// we're only checking the limits returned by the Usage API and ignoring usage limits missing from the results
 	// rationale:
 	// 1. if the Usage API doesn't send a limit because a resource is no longer limited, RP will continue cluster creation without impact
 	// 2. if the Usage API doesn't send a limit that is still enforced, cluster creation will fail on the backend and we will get an error in the RP logs
-	for _, usage := range usages {
-		required, present := requiredResources[*usage.Name.Value]
-		if present && int64(required) > (*usage.Limit-int64(*usage.CurrentValue)) {
-			return api.NewCloudError(http.StatusBadRequest, api.CloudErrorCodeResourceQuotaExceeded, "", "Resource quota of %s exceeded. Maximum allowed: %d, Current in use: %d, Additional requested: %d.", *usage.Name.Value, *usage.Limit, *usage.CurrentValue, required)
+	computeUsages, err := qv.spComputeUsage.List(ctx, qv.oc.Location)
+	if err != nil {
+		return err
+	}
+
+	qv.log.Print("Number of compute usages for location ", qv.oc.Location, ": ", len(computeUsages))
+	for _, computeUsage := range computeUsages {
+		qv.log.Print("Compute usage ", *computeUsage.Name.Value, ": ", *computeUsage.CurrentValue, " / ", *computeUsage.Limit)
+		required, present := requiredResources[*computeUsage.Name.Value]
+		if present && int64(required) > (*computeUsage.Limit-int64(*computeUsage.CurrentValue)) {
+			return api.NewCloudError(http.StatusBadRequest, api.CloudErrorCodeResourceQuotaExceeded, "", "Resource quota of %s exceeded. Maximum allowed: %d, Current in use: %d, Additional requested: %d.", *computeUsage.Name.Value, *computeUsage.Limit, *computeUsage.CurrentValue, required)
 		}
 	}
+
+	netUsages, err := qv.spNetworkUsage.List(ctx, qv.oc.Location)
+	if err != nil {
+		return err
+	}
+	qv.log.Print("Number of network usages for location ", qv.oc.Location, ": ", len(netUsages))
+	for _, netUsage := range netUsages {
+		qv.log.Print("Network usage ", *netUsage.Name.Value, ": ", *netUsage.CurrentValue, " / ", *netUsage.Limit)
+		required, present := requiredResources[*netUsage.Name.Value]
+		if present && int64(required) > (*netUsage.Limit-int64(*netUsage.CurrentValue)) {
+			return api.NewCloudError(http.StatusBadRequest, api.CloudErrorCodeResourceQuotaExceeded, "", "Resource quota of %s exceeded. Maximum allowed: %d, Current in use: %d, Additional requested: %d.", *netUsage.Name.Value, *netUsage.Limit, *netUsage.CurrentValue, required)
+		}
+	}
+
 	return nil
 }
